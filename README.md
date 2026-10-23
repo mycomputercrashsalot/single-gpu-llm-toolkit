@@ -1,140 +1,81 @@
 # single-gpu-llm-toolkit
 
-Twenty-two independently-runnable tools (twenty Python + two shell) for
-adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
-multi-node cluster, no external orchestration framework (no SLURM/Ray —
-though `--ddp`/`--fsdp` via `torch.distributed` is supported for multi-GPU
-nodes; see the `--ddp`/`--fsdp` flags under `train_cpt.py` below). The pipeline covers
-the full path from a base checkpoint to a trained one: shrink a tokenizer,
-grow a model's width and depth, continue-pretrain or fine-tune it, and
-survive the specific ways a single GPU fails you along the way — OOM,
-crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
-`benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
-data in, compare configs before committing to a long run, and actually talk
-to the model you just trained. `evaluate.py` measures perplexity, the three
-`export_*.py` tools convert a checkpoint to GGUF/ONNX/safetensors, and every
-tool ships its own `--selftest` or pytest coverage — transformation tools
-that need real checkpoints (`prune_vocab.py`, `prune_embeddings_torch.py`,
-`expand_model.py`) are covered by pytest logic tests instead, and the two
-shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are
-covered by `tests/test_shell.py` via pytest+subprocess with faked
-`/proc/meminfo`, stubbed `rocm-smi`, and a fake `train_cpt.py`; see
-[Testing](#testing). Everything is independently runnable — use the whole
-pipeline or just the one tool that solves your problem.
+Twenty-two standalone tools (twenty Python, two shell) for adapting an LLM
+checkpoint on a single AMD GPU under ROCm/PyTorch. No cluster and no
+orchestration framework. Multi-GPU nodes work too, through `--ddp`/`--fsdp`
+(torch.distributed), but the target is one card.
 
-All training here is full-parameter fine-tuning (`train_cpt.py` /
-`train_sft.py`) — no LoRA, no adapters. That's a deliberate choice, not an
-oversight: the quality this repo's own runs are built around comes from
-training the real weights, not a low-rank approximation of them.
+The pipeline runs from base checkpoint to trained model: shrink the
+tokenizer, grow the model's width and depth, continue-pretrain or
+fine-tune it, and survive the ways a single GPU fails mid-run. The
+supporting tools cover the rest of the path: `preprocess_data.py` cleans
+the data, `benchmark.py` compares configs before you commit to a long
+run, `generate.py` and `serve.py` talk to the trained model,
+`evaluate.py` measures perplexity, and the three `export_*.py` tools
+convert a checkpoint to GGUF/ONNX/safetensors.
 
-None of this is pinned to one GPU. The training loop itself doesn't branch on
-device name or VRAM — batch size, sequence length, and how many layers stay
-unfrozen are all plain CLI flags, so the same scripts scale down to a smaller
-card by freezing more layers and shrinking the batch, or scale up by unfreezing
-more and running bigger batches. Capability advertisement and preset suggestion
-DO use arch/VRAM (intentionally): `backends/rocm.py` gates fp8/flash-attn on
-the gfx arch, and `config/presets.py::suggest_preset` picks defaults by VRAM
-tier — but these only set defaults, never block a run. Standard ROCm/PyTorch
-throughout — nothing here calls out to an MI300X-only code path. It happens to
-have been built and run on one MI300X; there's nothing in it that ties it there.
-
-Here's what that actually buys you, concretely, instead of just abstractly:
-you don't have to choose between "fits in memory" and "actually trains all
-the weights." `--start`/`--end` freeze everything outside a layer window
-(`apply_window_freeze()` in `train_cpt.py`), so a card that can't hold
-gradients + optimizer state for the whole model can still do real,
-full-parameter training on a slice of it — no LoRA, no adapters, no
-low-rank approximation standing in for the actual weights, just less of
-the model unfrozen at once. Combine that with gradient checkpointing (on
-by default) and the 8-bit-Adam-with-AdamW-fallback optimizer
-(`bnb_optimizer.py`) and the same lever works in both directions: freeze
-more and shrink the batch on a smaller card, or unfreeze everything and
-run it wide on an 80GB+ one.
-
-The other half of "actually usable on hardware that isn't a managed
-cluster" is what happens when the run dies. `train_cpt.py` checkpoints
-every `--checkpoint-every` steps (500 by default) to local disk, and the
-write itself is atomic — `train_cpt.py`'s `atomic_save_checkpoint()` (or the opt-in `async_checkpoint.py`) builds the new checkpoint
-in a temp directory, then does two `os.replace()` calls (retire the live
-checkpoint to `.prev`, promote the temp dir to live), so a `kill -9` or a
-host reset mid-write can never leave you with a half-written, unreadable
-checkpoint; worst case it lands you on `.prev`, the last *good* one, not
-a corrupt new one. On restart, `train_cpt.py` doesn't need a `--resume`
-flag or you to remember a step number — it just checks whether
-`<save_dir>/training_state.pt` exists and picks up from there
-automatically. Practically: if your box resets mid-run, what you lose is
-whatever training happened since the last checkpoint boundary — at most
-`--checkpoint-every` steps of work, not the run. That number is steps, not
-minutes, on purpose — how long 500 steps takes depends on your model size,
-batch, and card, so there's no single wall-clock figure that holds across
-setups; for your own hardware, `benchmark.py` reports step time directly, or
-just watch `train_cpt.py`'s own iter logging.
-
-That resume mechanism is passive, though — it makes coming back from a
-crash cheap, it doesn't do the coming-back for you. `catch_and_resume.sh`
-is the part that does: it's a supervisor loop that actually relaunches
-`train_cpt.py` after any exit (crash, OOM-kill, preemption) and keeps
-doing so until the target iteration count is reached, a stop-file shows
-up, or the same-position-retry cap is hit (so a genuinely broken config
-doesn't retry forever, silently burning GPU-hours on a run that was never
-going to succeed). It also keeps a loss-tagged checkpoint history and
-rolls back to the best one on a loss regression, so a bad data patch
-doesn't get compounded checkpoint after checkpoint. `oom_guard.sh` is
-narrower and honest about it: it only watches memory and VRAM and sends a
-clean `SIGTERM` before a hard OOM can take the driver down with it — it
-does not relaunch anything itself. Run it standalone and a killed
-training process just stays dead; pair it with `catch_and_resume.sh` and
-the two together give you the actual unattended story: guard kills
-cleanly before real damage, checkpoint is already safe on disk from the
-SIGTERM handler, supervisor notices the exit and brings training back up
-on its own.
-
-Every model-specific constant — the embedding tensor's key name, the
-vocab_size config path, the layer-naming prefix, the sharding size, the
-depth/width step sizes, the GQA head count — is a CLI flag, defaulting to
-the Gemma-4 layout these tools were built against but pointable at whatever
-your own checkpoint actually uses. `expand_model.py`'s submodule key
-*suffixes* (`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/
-`o_proj`) used to be hardcoded, because those names are shared by most
-Llama-derived decoder architectures (Llama, Mistral, Qwen2/3, every Gemma
-generation) — verified directly against the installed `transformers`
-library's modeling source. They're not universal, though: GPT-2, the
-original Phi, Phi-3, Falcon, MPT, and BLOOM use different, fused-QKV naming.
-Those suffixes are now sourced from a model-family registry
-(`models.registry`, auto-detected from `config.json`'s `model_type` before
-any tensor is touched, overridable via `--model-family`) rather than
-hardcoded — the same detect-before-you-act pattern the GQA fix below uses.
-GPT-2 is the first fused-QKV architecture with real code support there: its
-`c_attn` is a `Conv1D` (weight stored transposed, Q|K|V fused as column
-blocks), so width expansion pads the opposite axis from the `nn.Linear` case
-and grows the Conv1D biases in lockstep with the weights, and the GQA pass
-is skipped outright (a fused layout has no separate `v_proj` for it to
-target). Verified end-to-end against a real GPT-2 checkpoint: expand →
-`from_pretrained` load (zero missing/unexpected keys) → forward pass (no
-NaN/Inf) → the zeroed-output-projection duplicate layers confirmed
-numerically no-op. Phi-3/Falcon/MPT/BLOOM still need per-architecture code
-(not a flag) to support; they fail cleanly with a `KeyError` on a missing
-tensor key rather than silently doing the wrong thing.
-`expand_model.py`'s GQA fix runs a detection pass against the loaded
-checkpoint's real tensors before touching anything, and skips cleanly with
-a logged reason if the checkpoint doesn't match the MQA layout it targets,
-instead of assuming every input does.
-
-You don't need to use these together or in order — each one solves a
-different single-GPU problem on its own. The canonical pipeline order, if
-you use them together, is:
+Every tool runs on its own; use the whole pipeline or just the piece that
+solves your problem. The canonical order, if you use them together:
 
 ```
 [preprocess_data.py] → prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py / train_sft.py → [generate.py]
 ```
 
-Skip whichever steps you don't need — data preprocessing, pruning, expansion,
-and MTP are all independently optional, and training directly against an
-unmodified base checkpoint with raw JSONL is a completely normal way to use
-`train_cpt.py` (or `train_sft.py`, its SFT-only alias — see below) on its
-own. `benchmark.py` sits outside this chain entirely — run it against any
-checkpoint, at any point, to measure a config rather than train or generate
-from it.
+Everything in brackets, and every step before training, is optional.
+Training against an unmodified base checkpoint with raw JSONL is a normal
+way to use `train_cpt.py` alone. `benchmark.py` sits outside the chain:
+run it against any checkpoint, at any point, to measure a config.
+
+Training is full-parameter only. No LoRA, no adapters. On a card that
+cannot hold gradients and optimizer state for the whole model, `--start`
+and `--end` freeze everything outside a layer window, so a smaller card
+trains a real slice of the weights instead of a low-rank approximation.
+Gradient checkpointing is on by default, and `bnb_optimizer.py` uses
+8-bit Adam with an AdamW fallback. The same flags scale down to a 24GB
+card and up to an 80GB one.
+
+Nothing is pinned to the hardware it was built on. The training loop
+never branches on device name or VRAM; batch size, sequence length, and
+the layer window are plain CLI flags. `backends/rocm.py` and
+`config/presets.py` do read the gfx arch and VRAM tier, but only to pick
+defaults, never to block a run. This was built and run on an MI300X, and
+nothing in it requires one.
+
+When a run dies, `train_cpt.py` checkpoints every `--checkpoint-every`
+steps (500 by default), and the write is atomic: the new checkpoint is
+built in a temp directory and promoted with two `os.replace()` calls, so
+a `kill -9` or host reset mid-write cannot corrupt the previous one. On
+restart it picks up from `<save_dir>/training_state.pt` automatically; a
+crash costs at most one checkpoint interval of work.
+
+`catch_and_resume.sh` is the supervisor on top: it relaunches training
+after any exit, up to a same-position retry cap so a broken config cannot
+retry forever, and it rolls back to the best loss-tagged checkpoint on a
+regression. `oom_guard.sh` is narrower. It watches system RAM and VRAM
+and sends a clean SIGTERM before a hard OOM can take the driver down. It
+does not relaunch anything itself. Run the two together and an unattended
+run kills cleanly and comes back on its own.
+
+Model-specific constants are CLI flags defaulting to the Gemma-4 layout
+these tools were built against: embedding tensor key names, vocab_size
+config paths, layer prefixes, sharding size, depth/width step sizes, GQA
+head count. Submodule key suffixes come from a model-family registry
+(`models/registry.py`), auto-detected from `config.json`'s `model_type`
+before any tensor is touched and overridable with `--model-family`.
+GPT-2 is supported end to end: its fused `c_attn` is a Conv1D with the
+weight stored transposed, so width expansion pads the opposite axis,
+biases grow in lockstep, and the GQA pass is skipped. That path is
+verified against a real GPT-2 checkpoint (expand, clean
+`from_pretrained` load, clean forward pass). Phi-3, Falcon, MPT, and
+BLOOM also use fused-QKV naming but still need per-architecture code;
+for now they fail with a clean `KeyError` on a missing tensor key rather
+than doing the wrong thing silently.
+
+Testing: every Python tool ships a `--selftest`. The transformation tools
+that need real checkpoints are covered by pytest logic tests instead, and
+the two shell scripts are covered by `tests/test_shell.py` with faked
+`/proc/meminfo`, stubbed `rocm-smi`, and a fake `train_cpt.py`. See
+[Testing](#testing).
 
 ## Table of Contents
 
@@ -725,12 +666,13 @@ python3 compress_model.py --src ./checkpoints/base_15b --dst ./checkpoints/base_
 ## `evaluate.py` — batch perplexity evaluation
 
 Computes mean cross-entropy loss and perplexity on a JSONL dataset (each line
-needs a `"text"` field) using a trained checkpoint. Supports all dtypes
-(fp32/fp16/bf16/fp8) via the shared `runtime.DTYPE_MAP` + `resolve_dtype` —
-fp8 falls back to bf16 on hardware without native fp8. Passes
-`attention_mask` so padded positions don't skew the loss. Honors
-`--gfx-override`/`--hip-alloc-conf` for consumer AMD cards, same as
-`generate.py`.
+needs a `"text"` field) using a trained checkpoint. Malformed lines are
+skipped with a warning instead of crashing. Uses `torch.inference_mode()` and
+passes `attention_mask` so padded positions don't skew the loss. Supports all
+dtypes (fp32/fp16/bf16/fp8) via the shared `runtime.DTYPE_MAP` +
+`resolve_dtype`, with fp8 falling back to bf16 on hardware without native
+fp8. Honors `--gfx-override`/`--hip-alloc-conf` for consumer AMD cards, same
+as `generate.py`.
 
 ```
 python3 evaluate.py --model ./checkpoints/model_cpt_1 --data eval.jsonl --batch-size 4
@@ -1007,19 +949,6 @@ as optional in `requirements.txt`).
 ```
 python3 serve.py --model ./checkpoints/model_cpt_1 --port 8000 --flash-attn
 # Then: curl http://localhost:8000/v1/chat/completions ...
-```
-
-## `evaluate.py` — batch perplexity evaluation
-
-Computes mean cross-entropy loss and perplexity on a JSONL evaluation set.
-Loads the model with the same ROCm bootstrap as every other GPU tool
-(`--gfx-override`, `--hip-alloc-conf`). Skips malformed JSONL lines with a
-warning instead of crashing. Uses `torch.inference_mode()` and passes
-`attention_mask` to avoid attending to pad tokens.
-
-```
-python3 evaluate.py --model ./checkpoints/model_cpt_1 --data ./data/valid.jsonl \
-    --batch 4 --max-seq-len 2048 --dtype bf16
 ```
 
 ## `rocprof_trace.py` — AMD rocprof profiling wrapper
