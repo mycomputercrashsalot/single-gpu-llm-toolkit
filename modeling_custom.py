@@ -558,3 +558,109 @@ class CustomForCausalLM(_BaseForCausalLM):
         if "mtp_past_key_values" in kwargs:
             model_inputs["past_key_values"] = kwargs["mtp_past_key_values"]
         return model_inputs
+
+
+# ── self-test (CPU-only, no GPU) ─────────────────────────────────────────────
+
+def _self_test():
+    """CPU-only self-test: build the tiniest Gemma3-family config this module
+    supports with mtp_depths=2, run a forward pass with labels, and check for
+    a finite loss + correct mtp_logits shapes. then mtp_depths=0, which has
+    to be a clean no-op (no mtp_layers, no mtp_hidden_states)."""
+    import importlib
+    import sys
+
+    print("[selftest] modeling_custom: MTP forward with labels + depths=0 no-op (CPU)")
+    # same gate the pytest suite's modeling_custom tests use: if this
+    # transformers install has no Gemma3TextConfig its too old for the
+    # MTP-capable families this module wraps, so skip, don't fail
+    try:
+        from transformers import Gemma3TextConfig  # noqa: F401
+    except ImportError as exc:
+        print(f"[selftest] SKIP: Gemma3TextConfig not available in this transformers "
+              f"version ({exc}) -- nothing to self-test against. Exiting 0.")
+        return
+
+    import torch
+
+    # this module resolves _BaseForCausalLM ONCE at import time from
+    # model_family (config.json next to this file, else the MODEL_FAMILY env
+    # var). run directly from the repo root there is no config.json, so
+    # __main__ holds the _ModelFamilyNotSet sentinel and CustomForCausalLM(...)
+    # would just raise. so import this file again under its own module name
+    # with MODEL_FAMILY set, the documented env-var fallback, which is also
+    # how the pytest suite gets a usable class (see the modeling_custom_gemma
+    # fixture in tests/test_all.py).
+    #
+    # family "llama", not "gemma", for the same reason that fixture
+    # documents: the gemma chain resolves to Gemma4ForCausalLM on transformers
+    # 5.5+ and Gemma-4 decoder layers want a per-layer input embedding
+    # (per_layer_input) the MTP head does not supply, so wrapping one raises
+    # TypeError. that is a REAL limitation of this module, not a selftest bug.
+    # the config class comes from whichever base actually resolved
+    # (hardcoding Gemma3TextConfig against a Gemma-4 base blows up with
+    # AttributeError on config fields the class doesn't carry).
+    orig_env = os.environ.get("MODEL_FAMILY")
+    os.environ["MODEL_FAMILY"] = "llama"
+    try:
+        if "modeling_custom" in sys.modules:
+            mod = importlib.reload(sys.modules["modeling_custom"])
+        else:
+            mod = importlib.import_module("modeling_custom")
+    finally:
+        if orig_env is None:
+            os.environ.pop("MODEL_FAMILY", None)
+        else:
+            os.environ["MODEL_FAMILY"] = orig_env
+
+    ConfigCls = mod._BaseForCausalLM.config_class
+    base_cfg = dict(vocab_size=100, hidden_size=32, intermediate_size=64,
+                    num_hidden_layers=2, num_attention_heads=4,
+                    num_key_value_heads=2, max_position_embeddings=64)
+
+    config = ConfigCls(**base_cfg)
+    config.mtp_depths = 2
+    config.mtp_loss_weight = 0.3
+    model = mod.CustomForCausalLM(config)
+    model.eval()
+
+    input_ids = torch.randint(0, 100, (2, 8))
+    labels = input_ids.clone()
+    with torch.no_grad():
+        out = model(input_ids=input_ids, labels=labels)
+    assert out.loss is not None and torch.isfinite(out.loss), out.loss
+    assert out.loss.item() > 0.0, out.loss
+    assert len(out.mtp_logits) == 2, len(out.mtp_logits)
+    for depth, logits in enumerate(out.mtp_logits):
+        assert logits.shape == (2, 8, 100), (depth, tuple(logits.shape))
+    print(f"  OK (mtp_depths=2 forward with labels: loss={out.loss.item():.4f} "
+          f"finite, mtp_logits shapes {[tuple(l.shape) for l in out.mtp_logits]})")
+
+    # depths=0 no-op: no mtp_layers registered and no mtp_hidden_states on
+    # the output, forward runs exactly like the base CausalLM
+    model0 = mod.CustomForCausalLM(ConfigCls(**base_cfg))
+    model0.eval()
+    assert not hasattr(model0.model, "mtp_layers")
+    with torch.no_grad():
+        out0 = model0(input_ids=input_ids)
+    assert not hasattr(out0, "mtp_hidden_states")
+    assert out0.logits.shape == (2, 8, 100), tuple(out0.logits.shape)
+    print("  OK (mtp_depths=0 no-op: no mtp_layers, no mtp_hidden_states, "
+          "clean forward)")
+
+    print("\n[selftest] All checks passed (CPU-only, no GPU required).")
+
+
+if __name__ == "__main__":
+    # no CLI in this file, it's a library copied alongside checkpoints and
+    # loaded via trust_remote_code. --selftest is the only direct-run mode
+    import argparse
+
+    ap = argparse.ArgumentParser(description="modeling_custom.py self-test")
+    ap.add_argument("--selftest", action="store_true", default=False,
+                    help="Run built-in self-test (CPU-only, no GPU required).")
+    args = ap.parse_args()
+    if not args.selftest:
+        ap.error("modeling_custom.py is a library, not a CLI -- "
+                 "only --selftest is supported.")
+    _self_test()

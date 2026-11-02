@@ -230,59 +230,72 @@ def main():
 
 
 def _self_test():
-    """Self-test: exercise argparse flag aliasing and DTYPE_MAP coverage (no GPU)."""
-    print("[selftest] evaluate: flag aliasing + dtype coverage (no GPU required)")
+    """Self-test: run main() end-to-end on a tiny real GPT-2 checkpoint and a
+    3-row JSONL, all on CPU (no GPU needed), and assert the reported
+    metrics."""
+    import contextlib
+    import io
+    import math
+    import os
+    import re
+    import tempfile
 
-    # Test JSONL error handling: malformed lines are skipped, not fatal.
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write('{"text": "hello world"}\n')
-        f.write('{bad json\n')
-        f.write('{"text": "second valid"}\n')
-        fpath = f.name
-    _texts, _malformed = [], 0
-    with open(fpath) as f:
-        for line in f:
-            try:
-                _obj = json.loads(line)
-                _texts.append(_obj["text"])
-            except json.JSONDecodeError:
-                _malformed += 1
-    os.unlink(fpath)
-    assert len(_texts) == 2, f"expected 2 valid, got {len(_texts)}"
-    assert _malformed == 1, f"expected 1 malformed, got {_malformed}"
-    print("  OK (malformed JSONL skipped, valid rows kept)")
+    print("[selftest] evaluate: main() on a tiny GPT-2 checkpoint (CPU, no GPU)")
+    with tempfile.TemporaryDirectory() as td:
+        from transformers import GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast
 
-    # Flag aliasing: --batch-size and --batch must both set dest=batch_size;
-    # --seq-length and --max-seq-len must both set dest=seq_length.
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--batch-size", "--batch", type=int, default=1, dest="batch_size")
-    ap.add_argument("--seq-length", "--max-seq-len", type=int, default=2048, dest="seq_length")
-    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="bf16")
+        model_dir = os.path.join(td, "tiny_gpt2")
+        # same tiny config as tests/test_all.py's _build_tiny_gpt2_checkpoint,
+        # real GPT-2 architecture just small enough to load + forward on CPU
+        # in seconds. vocab_size=50257 becuase the real GPT-2 tokenizer's ids
+        # have to stay in range
+        cfg = GPT2Config(vocab_size=50257, n_positions=128, n_embd=32,
+                         n_layer=2, n_head=4)
+        GPT2LMHeadModel(cfg).save_pretrained(model_dir)
+        try:
+            GPT2TokenizerFast.from_pretrained("gpt2").save_pretrained(model_dir)
+        except Exception as exc:
+            # the HF cache (network or local) is the only source of a real
+            # GPT-2 tokenizer and main() flat out needs one to run. nothing
+            # real to test without it, so skip rather than fake it
+            print(f"[selftest] SKIP: GPT-2 tokenizer unavailable ({exc}). "
+                  f"evaluate.py needs a real tokenizer for its main() path; "
+                  f"nothing to self-test without one.")
+            return
 
-    a = ap.parse_args(["--batch-size", "4"])
-    assert a.batch_size == 4, a.batch_size
-    a = ap.parse_args(["--batch", "8"])
-    assert a.batch_size == 8, a.batch_size
-    a = ap.parse_args(["--seq-length", "1024"])
-    assert a.seq_length == 1024, a.seq_length
-    a = ap.parse_args(["--max-seq-len", "512"])
-    assert a.seq_length == 512, a.seq_length
-    print("  OK (flag aliases --batch/--batch-size, --max-seq-len/--seq-length both work)")
+        data = os.path.join(td, "train.jsonl")
+        with open(data, "w") as f:
+            for text in ("hello world", "the quick brown fox",
+                         "pack my box with five dozen jugs"):
+                f.write(json.dumps({"text": text}) + "\n")
 
-    # DTYPE_MAP includes fp8 (the crash this repo fixed).
-    from runtime import DTYPE_MAP
-    import torch
-    assert DTYPE_MAP["fp8"] is torch.bfloat16
-    assert DTYPE_MAP["bf16"] is torch.bfloat16
-    print("  OK (DTYPE_MAP covers fp8 -> bf16)")
+        # run the real main() path, argv patched the same way the pytest suite
+        # drives CLIs. --batch-size 2 over 3 rows forces two batches so the
+        # padding + attention_mask + label-masking loop actually runs
+        old_argv = sys.argv
+        sys.argv = ["evaluate.py", "--model", model_dir, "--data", data,
+                    "--device", "cpu", "--dtype", "fp32",
+                    "--batch-size", "2", "--seq-length", "64"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                main()
+        finally:
+            sys.argv = old_argv
 
-    # Perplexity math sanity: exp(loss) where loss=0 -> ppl=1.0.
-    assert math.exp(0.0) == 1.0
-    assert math.exp(1.0) == math.e
-    print("  OK (perplexity = exp(mean_loss) math verified)")
+        m = re.search(r"mean_loss=([0-9.]+) perplexity=([0-9.]+) tokens=(\d+)",
+                      buf.getvalue())
+        assert m, ("main() did not print its metrics line, got:\n"
+                   + buf.getvalue())
+        mean_loss, ppl, n_tokens = (float(m.group(1)), float(m.group(2)),
+                                    int(m.group(3)))
+        assert math.isfinite(mean_loss) and mean_loss > 0.0, mean_loss
+        assert math.isfinite(ppl) and ppl > 0.0, ppl
+        assert n_tokens > 0, n_tokens
+        print(f"  OK (mean_loss={mean_loss:.4f} finite, perplexity={ppl:.2f} > 0, "
+              f"tokens={n_tokens} > 0)")
 
-    print("\n[selftest] All checks passed.")
+    print("\n[selftest] All checks passed (CPU-only, no GPU required).")
 
 
 def main_cli():

@@ -73,30 +73,46 @@ def main():
 
 
 def _self_test():
-    print("[selftest] export_gguf: convert-script detection + command construction")
+    """Self-test: point main() at a --convert-script that doesn't exist and
+    assert it exits 1 after printing the manual command for exactly those
+    args (the argv-forwarding contract). no convert script gets faked here,
+    the not-found error path is the real behavior under test."""
+    import contextlib
+    import io
+    import os
+    import tempfile
 
-    # Test convert-script path detection with --convert-script override.
-    # The tool should construct the correct command (positional src, not --src).
-    ap = argparse.ArgumentParser(description="test")
-    ap.add_argument("--src", required=True)
-    ap.add_argument("--dst", required=True)
-    ap.add_argument("--outtype", default="f16")
-    ap.add_argument("--convert-script", default=None)
+    print("[selftest] export_gguf: missing convert-script -> exit 1 + manual command")
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "src")
+        os.makedirs(src)
+        dst = os.path.join(td, "model.gguf")
+        missing_script = os.path.join(td, "no_such_convert_hf_to_gguf.py")
+        assert not os.path.exists(missing_script)
 
-    args = ap.parse_args(["--src", "/fake/src", "--dst", "/fake/dst.gguf"])
-    # Simulate the command construction (without running it).
-    cmd = [sys.executable, "/fake/convert.py", args.src,
-           "--outfile", args.dst, "--outtype", args.outtype]
-    # Verify the command uses positional src (not --src), matching llama.cpp's API.
-    assert "/fake/src" in cmd, "src should be a positional argument"
-    assert "--src" not in cmd, "src should NOT be a --src flag (llama.cpp uses positional)"
-    assert "--outfile" in cmd
-    assert "--outtype" in cmd
-    print("  OK (command uses positional src, --outfile, --outtype)")
+        old_argv = sys.argv
+        sys.argv = ["export_gguf.py", "--src", src, "--dst", dst,
+                    "--outtype", "q8_0", "--convert-script", missing_script]
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                main()
+            raise AssertionError(
+                "main() should have exited 1 for a nonexistent --convert-script")
+        except SystemExit as e:
+            assert e.code == 1, f"expected exit code 1, got {e.code}"
+        finally:
+            sys.argv = old_argv
 
-    # Test outtype default.
-    assert args.outtype == "f16", f"default outtype should be f16, got {args.outtype}"
-    print("  OK (default outtype is f16)")
+        # the manual command has to come out with OUR argv forwarded into it
+        # (positional src, --outfile dst, --outtype) so a user can copy-paste
+        # it against a real llama.cpp checkout
+        msg = err.getvalue()
+        assert "convert_hf_to_gguf.py" in msg, msg
+        assert src in msg, f"manual command must forward --src, got:\n{msg}"
+        assert f"--outfile {dst}" in msg, f"manual command must forward --dst, got:\n{msg}"
+        assert "--outtype q8_0" in msg, f"manual command must forward --outtype, got:\n{msg}"
+        print("  OK (exit code 1; manual command printed with src/dst/outtype forwarded)")
 
     print("\n[selftest] All checks passed (no GPU/llama.cpp required).")
 

@@ -107,8 +107,8 @@ def set_dotted_path(cfg: dict, dotted_path: str, value) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", required=True, help="Source model dir (read-only, never modified)")
-    ap.add_argument("--dst", required=True, help="Output dir for the pruned model")
+    ap.add_argument("--src", help="Source model dir (read-only, never modified)")
+    ap.add_argument("--dst", help="Output dir for the pruned model")
     ap.add_argument("--dry-run", action="store_true", help="Print stats only, write nothing")
     ap.add_argument("--vocab-size-paths", type=str, nargs="+",
                     default=["vocab_size", "text_config.vocab_size"],
@@ -118,7 +118,17 @@ def main():
                          "docstring for why both matter on Gemma-4. Pass your own dotted "
                          "path(s) if a different model family nests vocab_size somewhere "
                          "else, e.g. --vocab-size-paths vocab_size some_other.nested.path")
+    ap.add_argument("--selftest", action="store_true", default=False,
+                    help="Run built-in self-test (no GPU required).")
     args = ap.parse_args()
+
+    if args.selftest:
+        _self_test()
+        return
+
+    # Validate required args AFTER the --selftest check.
+    if not args.src or not args.dst:
+        ap.error("--src and --dst are required (unless --selftest).")
 
     src, dst = args.src, args.dst
     if os.path.abspath(src) == os.path.abspath(dst):
@@ -276,6 +286,113 @@ def main():
     print("[prune_vocab] NEXT STEP: run prune_embeddings_torch.py against this dir to slice "
           "the embed_tokens.weight tensor — this dir is NOT yet a loadable model "
           "(safetensors still have the old full-size embedding matrix).")
+
+
+def _self_test():
+    """Self-test: a tiny tokenizer.json (ASCII + CJK tokens, both merge
+    formats, added_tokens) + config.json in a tempdir, run through main();
+    then check the kept vocab, the filtered merges, the id remap,
+    vocab_size at both config paths, and the model_type rename (no GPU
+    needed)."""
+    import sys
+    import tempfile
+
+    import torch
+    from safetensors.torch import save_file
+
+    print("[selftest] prune_vocab: tiny tokenizer + config through main()")
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "src")
+        dst = os.path.join(td, "dst")
+        os.makedirs(src)
+
+        # tiny vocab: ASCII tokens to keep, a CJK content token to drop, plus
+        # an added/special CJK token (protected, special tokens are alwasy
+        # kept regardless of script)
+        vocab = {
+            "<pad>": 0, "Ġ": 1, "t": 2, "h": 3, "Ġt": 4, "Ġh": 5,
+            "世界": 6, "你好": 7, "x": 8,
+        }
+        # both on-disk merge formats (see main()'s merge-filtering block):
+        # HF tokenizers' "a b" strings and the older [a, b] lists
+        merges = ["Ġ t", "Ġ h", ["Ġ", "t"], "世 界", "x y", ["世", "界"]]
+        tok = {
+            "version": "1.0",
+            "model": {"type": "BPE", "vocab": vocab, "merges": merges},
+            "added_tokens": [
+                {"id": 0, "content": "<pad>", "special": True},
+                {"id": 7, "content": "你好", "special": True},
+            ],
+        }
+        with open(os.path.join(src, "tokenizer.json"), "w") as f:
+            json.dump(tok, f, ensure_ascii=False)
+
+        # gemma-4-family config layout: vocab_size at BOTH paths plus the
+        # model_type that main() renames
+        cfg = {
+            "model_type": "gemma4_unified",
+            "vocab_size": 9,
+            "text_config": {"vocab_size": 9},
+        }
+        with open(os.path.join(src, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        # weights deliberately NOT copied, that's prune_embeddings_torch.py's
+        # job. a real tiny safetensors file proves the contract
+        save_file({"dummy.weight": torch.zeros(2, 2)},
+                  os.path.join(src, "model.safetensors"))
+
+        old_argv = sys.argv
+        sys.argv = ["prune_vocab.py", "--src", src, "--dst", dst]
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+        # kept vocab should be the 8 ASCII/structural tokens plus the
+        # protected CJK added token, with the CJK content token dropped and
+        # ids remapped contiguously in their original relative order
+        expected_keep = ["<pad>", "Ġ", "t", "h", "Ġt", "Ġh", "你好", "x"]
+        with open(os.path.join(dst, "tokenizer.json")) as f:
+            out_tok = json.load(f)
+        out_vocab = out_tok["model"]["vocab"]
+        assert sorted(out_vocab.keys()) == sorted(expected_keep), \
+            sorted(out_vocab.keys())
+        assert sorted(out_vocab.values()) == list(range(len(expected_keep)))
+        assert out_vocab["<pad>"] == 0 and out_vocab["Ġ"] == 1
+        assert out_vocab["你好"] == 6 and out_vocab["x"] == 7
+        print("  OK (kept vocab: CJK content token dropped, added CJK token "
+              "protected, ids contiguous and order-preserving)")
+
+        # merges: only the ones whose parts AND merged result all survive,
+        # each pair keeping its original format (string vs list)
+        assert out_tok["model"]["merges"] == ["Ġ t", "Ġ h", ["Ġ", "t"]], \
+            out_tok["model"]["merges"]
+        print("  OK (merges filtered in both string and list formats)")
+
+        # added_tokens ids get remapped into the new id space
+        out_added = {t["content"]: t["id"] for t in out_tok["added_tokens"]}
+        assert out_added == {"<pad>": 0, "你好": 6}, out_added
+        print("  OK (added_tokens ids remapped)")
+
+        # the id remap for prune_embeddings_torch.py
+        with open(os.path.join(dst, "_old_to_new_ids.json")) as f:
+            out_remap = json.load(f)
+        assert out_remap == {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4,
+                             "5": 5, "7": 6, "8": 7}, out_remap
+        print("  OK (_old_to_new_ids.json written with the expected remap)")
+
+        # config.json: vocab_size updated at BOTH default paths, model_type
+        # renamed, and no safetensors copied over
+        with open(os.path.join(dst, "config.json")) as f:
+            out_cfg = json.load(f)
+        assert out_cfg["vocab_size"] == 8, out_cfg["vocab_size"]
+        assert out_cfg["text_config"]["vocab_size"] == 8
+        assert out_cfg["model_type"] == "gemma4", out_cfg["model_type"]
+        assert not os.path.exists(os.path.join(dst, "model.safetensors"))
+        print("  OK (vocab_size updated at both config paths, model_type "
+              "'gemma4_unified' -> 'gemma4', safetensors not copied)")
+
+    print("\n[selftest] All checks passed (no GPU required).")
 
 
 if __name__ == "__main__":

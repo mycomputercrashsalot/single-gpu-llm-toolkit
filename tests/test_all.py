@@ -843,81 +843,80 @@ def test_classify_keeps_ascii_drops_cjk():
 
 # ── prune_embeddings_torch.py slicing logic ─────────────────────────────────
 
-def test_prune_embeddings_int_coercion_and_contiguity():
+def test_prune_embeddings_int_coercion_and_contiguity(tmp_path):
     """The remap loading: {int(k): int(v)} coerces BOTH keys and values, and
     the contiguity check (sorted values == range(N)) rejects non-contiguous
-    remaps. This is the logic at prune_embeddings_torch.py:60-67."""
-    # Simulate the remap loading + validation inline (main() does file I/O;
-    # we test the pure-logic part that would break if coercion is wrong).
-    # A correct remap: old ids 0,2,4 -> new ids 0,1,2 (contiguous).
-    raw_json = '{"0": 0, "2": 1, "4": 2}'  # string keys (as written by prune_vocab)
-    old_to_new = {int(k): int(v) for k, v in json.loads(raw_json).items()}
+    remaps. this is the logic in prune_embeddings_torch.py's load_remap() /
+    contiguous_keep_ids(), which got pulled out of main() so the test calls
+    the real module instead of re-implementing it."""
+    import prune_embeddings_torch
+
+    # a correct remap: old ids 0,2,4 -> new ids 0,1,2 (contiguous), written
+    # the way prune_vocab.py writes it, string keys AND values
+    remap_path = tmp_path / "_old_to_new_ids.json"
+    remap_path.write_text('{"0": 0, "2": 1, "4": 2}')
+    old_to_new = prune_embeddings_torch.load_remap(str(remap_path))
     assert old_to_new == {0: 0, 2: 1, 4: 2}
-    keep_old_ids = sorted(old_to_new.keys())
-    new_vocab_size = len(keep_old_ids)
-    expected_new_ids = sorted(old_to_new.values())
-    assert expected_new_ids == list(range(new_vocab_size))  # contiguous: passes
+    keep_ids, new_vocab_size = prune_embeddings_torch.contiguous_keep_ids(old_to_new)
+    assert keep_ids == [0, 2, 4]
+    assert new_vocab_size == 3
 
-    # A non-contiguous remap (values 0, 2, 5 — gap) should fail the check.
-    bad_json = '{"0": 0, "2": 2, "4": 5}'
-    bad_map = {int(k): int(v) for k, v in json.loads(bad_json).items()}
-    bad_values = sorted(bad_map.values())
-    assert bad_values != list(range(len(bad_map)))  # non-contiguous: would abort
+    # a non-contiguous remap (values 0, 2, 5, gap) must be rejected
+    remap_path.write_text('{"0": 0, "2": 2, "4": 5}')
+    bad_map = prune_embeddings_torch.load_remap(str(remap_path))
+    with pytest.raises(SystemExit):
+        prune_embeddings_torch.contiguous_keep_ids(bad_map)
 
 
-def test_prune_embeddings_single_file_index_synthesis():
+def test_prune_embeddings_single_file_index_synthesis(tmp_path):
     """When a checkpoint has no model.safetensors.index.json but does have a
-    single model.safetensors, prune_embeddings_torch synthesizes an index from
-    the safetensors header. This test exercises that synthesis logic against a
-    real tiny safetensors file."""
+    single model.safetensors, prune_embeddings_torch synthesizes an index
+    from the safetensors header, wether the download came sharded or as one
+    lone file. this test runs the real module's index resolver and row slicer
+    against a real tiny safetensors file (it previously re-implemented both
+    inline, so a regression in the module itself went unnoticed)."""
     import torch
     from safetensors.torch import save_file, load_file
 
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        embed_key = "model.embed_tokens.weight"
-        other_key = "model.layers.0.fc.weight"
+    import prune_embeddings_torch
 
-        # Create a tiny single-file checkpoint: embed (10 x 4) + one other tensor.
-        tensors = {
-            embed_key: torch.randn(10, 4).to(torch.bfloat16),
-            other_key: torch.randn(4, 4).to(torch.bfloat16),
-        }
-        save_file(tensors, td / "model.safetensors")
+    td = tmp_path
+    embed_key = "model.embed_tokens.weight"
+    other_key = "model.layers.0.fc.weight"
 
-        # Also write the remap (prune_vocab.py's output): keep old ids 0,2,4,6,8
-        # -> new ids 0,1,2,3,4 (drop odds).
-        remap = {str(k): v for k, v in zip([0, 2, 4, 6, 8], range(5))}
-        remap_dst = td / "dst"
-        remap_dst.mkdir()
-        with open(remap_dst / "_old_to_new_ids.json", "w") as f:
-            json.dump(remap, f)
+    # a tiny single-file checkpoint: embed (10 x 4) + one other tensor
+    tensors = {
+        embed_key: torch.randn(10, 4).to(torch.bfloat16),
+        other_key: torch.randn(4, 4).to(torch.bfloat16),
+    }
+    save_file(tensors, str(td / "model.safetensors"))
 
-        # Synthesize the index (same logic as prune_embeddings_torch.py:80-88).
-        single_file = "model.safetensors"
-        with open(td / single_file, "rb") as f:
-            header_len = int.from_bytes(f.read(8), "little")
-            header = json.loads(f.read(header_len))
-        weight_map = {k: single_file for k in header if k != "__metadata__"}
-        index = {"metadata": {"total_size": os.path.getsize(td / single_file)},
-                 "weight_map": weight_map}
+    # also write the remap (prune_vocab.py's output): keep old ids 0,2,4,6,8
+    # -> new ids 0,1,2,3,4, drop the odds
+    remap = {str(k): v for k, v in zip([0, 2, 4, 6, 8], range(5))}
+    remap_dst = td / "dst"
+    remap_dst.mkdir()
+    (remap_dst / "_old_to_new_ids.json").write_text(json.dumps(remap))
 
-        # Verify the synthesized index covers both tensors.
-        assert embed_key in index["weight_map"]
-        assert other_key in index["weight_map"]
-        assert index["weight_map"][embed_key] == single_file
+    # the real resolver: no index.json present, so it makes one from the
+    # safetensors header covering every tensor in the file
+    index = prune_embeddings_torch.resolve_index(str(td))
+    assert embed_key in index["weight_map"]
+    assert other_key in index["weight_map"]
+    assert index["weight_map"][embed_key] == "model.safetensors"
 
-        # Verify the row-slicing logic (prune_embeddings_torch.py:115):
-        # keep_idx = [0,2,4,6,8], slicing embed[keep_idx] gives 5x4.
-        old_to_new = {int(k): int(v) for k, v in remap.items()}
-        keep_old_ids = sorted(old_to_new.keys())
-        keep_idx = torch.tensor(keep_old_ids, dtype=torch.long)
-        loaded = load_file(td / single_file)
-        sliced = loaded[embed_key][keep_idx, :].contiguous()
-        assert sliced.shape == (5, 4), sliced.shape
-        # Verify the right rows were kept.
-        for i, old_id in enumerate(keep_old_ids):
-            assert torch.equal(sliced[i], loaded[embed_key][old_id])
+    # the real slicer: keep_idx = [0,2,4,6,8], slicing embed[keep_idx] gives
+    # 5x4 with exactly those rows
+    old_to_new = prune_embeddings_torch.load_remap(
+        str(remap_dst / "_old_to_new_ids.json"))
+    keep_old_ids, _ = prune_embeddings_torch.contiguous_keep_ids(old_to_new)
+    loaded = load_file(str(td / "model.safetensors"))
+    sliced = prune_embeddings_torch.slice_embed_rows(loaded[embed_key],
+                                                     keep_old_ids)
+    assert sliced.shape == (5, 4), sliced.shape
+    # verify the right rows survived
+    for i, old_id in enumerate(keep_old_ids):
+        assert torch.equal(sliced[i], loaded[embed_key][old_id])
 
 
 # ── expand_model.py transformation logic ────────────────────────────────────

@@ -99,36 +99,49 @@ def main():
 
 
 def _self_test():
-    print("[selftest] export_onnx: flag aliasing + dtype map (no GPU required)")
+    """Self-test: run main() on a tiny real GPT-2 checkpoint and validate the
+    exported graph with onnx.checker (CPU, no GPU needed).
 
-    # Test flag aliasing: --batch/--batch-size and --max-seq-len/--seq-length
-    # write to the SAME dest names main() actually reads (args.batch,
-    # args.max_seq_len) -- regression test for the dest-name drift documented
-    # in main()'s argparse block above.
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--max-seq-len", "--seq-length", type=int, default=128,
-                    dest="max_seq_len")
-    ap.add_argument("--batch", "--batch-size", type=int, default=1, dest="batch")
-    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="fp32")
+    onnx/onnxscript get guarded the same way the pytest suite's ONNX test
+    guards them (tests/test_all.py importorskips both): if either one is
+    missing, print the reason and exit 0, don't fail."""
+    import sys
+    import tempfile
 
-    args1 = ap.parse_args(["--batch-size", "4", "--seq-length", "256"])
-    assert args1.batch == 4, f"--batch-size should set batch=4, got {args1.batch}"
-    assert args1.max_seq_len == 256, f"--seq-length should set max_seq_len=256, got {args1.max_seq_len}"
-    print("  OK (flag aliases --batch-size and --seq-length work)")
+    for dep in ("onnx", "onnxscript"):
+        try:
+            __import__(dep)
+        except ImportError as exc:
+            print(f"[selftest] SKIP: {dep} is not installed ({exc}) -- the ONNX "
+                  f"export path needs onnx + onnxscript. Install both to "
+                  f"exercise the full path. Exiting 0.")
+            return
 
-    args2 = ap.parse_args(["--dtype", "fp8"])
-    assert args2.dtype == "fp8"
-    print("  OK (fp8 dtype accepted)")
+    import onnx
+    from transformers import GPT2Config, GPT2LMHeadModel
 
-    # DTYPE_MAP is what main() actually uses to resolve --dtype to a torch
-    # dtype (torch_dtype = DTYPE_MAP[args.dtype]).
-    from runtime import DTYPE_MAP
-    import torch
-    assert DTYPE_MAP["fp8"] is torch.bfloat16
-    assert DTYPE_MAP["fp32"] is torch.float32
-    print("  OK (DTYPE_MAP covers fp8 -> bf16 for export load)")
+    print("[selftest] export_onnx: main() on a tiny GPT-2 checkpoint (CPU, no GPU)")
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "tiny_gpt2")
+        # same tiny config as tests/test_all.py's _build_tiny_gpt2_checkpoint
+        cfg = GPT2Config(vocab_size=50257, n_positions=128, n_embd=32,
+                         n_layer=2, n_head=4)
+        GPT2LMHeadModel(cfg).save_pretrained(src)
 
-    print("\n[selftest] All checks passed (no GPU required).")
+        dst = os.path.join(td, "model.onnx")
+        old_argv = sys.argv
+        sys.argv = ["export_onnx.py", "--src", src, "--dst", dst,
+                    "--dtype", "fp32", "--seq-length", "8"]
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+        assert os.path.isfile(dst), f"{dst} was not produced"
+        onnx.checker.check_model(onnx.load(dst))
+        print(f"  OK ({dst} exists and passes onnx.checker.check_model)")
+
+    print("\n[selftest] All checks passed (CPU-only, no GPU required).")
 
 
 def main_cli():
