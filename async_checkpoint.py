@@ -159,7 +159,7 @@ class AsyncCheckpointer:
         if self.is_write_in_flight():
             print("[ckpt-async] previous async write still in flight -- waiting for it "
                   "before starting a new snapshot (checkpoint interval may be too tight "
-                  "relative to write speed on this disk)")
+                  "relative to write speed on this disk)", flush=True)
             self._thread.join()
             # Re-check after join: the thread may have failed during join and
             # set _last_error, which check_error() above (called before join)
@@ -199,7 +199,7 @@ class AsyncCheckpointer:
             **(extra_state or {}),
         }
         print(f"[ckpt-async] step {step}: CPU snapshot done, disk write continuing in "
-              f"background -- training resumes immediately")
+              f"background -- training resumes immediately", flush=True)
 
         save_dir = Path(save_dir)
 
@@ -242,7 +242,7 @@ class AsyncCheckpointer:
                     print(f"[ckpt-async] WARNING: failed to write checksums.json "
                           f"({ckpt_err}) — corruption detection disabled for "
                           f"this checkpoint. Failure: {ckpt_err}",
-                          file=__import__('sys').stderr)
+                          file=__import__('sys').stderr, flush=True)
 
                 # Retain the previous checkpoint as .prev (a real backup, not
                 # deleted) so a crash mid-write or a corrupt new write can be
@@ -250,13 +250,13 @@ class AsyncCheckpointer:
                 # helper (same rotation as train_cpt.py's atomic_save_checkpoint).
                 atomic_replace_with_backup(tmp_dir, save_dir)
 
-                print(f"[ckpt-async] step {step}: background write finished -> {save_dir}")
+                print(f"[ckpt-async] step {step}: background write finished -> {save_dir}", flush=True)
             except Exception as e:
                 self._last_error = e
                 print(f"[ckpt-async] step {step}: BACKGROUND WRITE FAILED — "
                       f"error stored, will be raised on next save()/wait. "
                       f"Previous checkpoint retained at {save_dir}.prev if it "
-                      f"existed. Failure: {e}", file=__import__('sys').stderr)
+                      f"existed. Failure: {e}", file=__import__('sys').stderr, flush=True)
 
         self._thread = threading.Thread(target=_write, daemon=False)
         self._thread.start()
@@ -266,7 +266,7 @@ class AsyncCheckpointer:
         (SIGTERM handler, final checkpoint) so the process never dies mid-write.
         Re-raises any error captured by the background thread."""
         if self.is_write_in_flight():
-            print("[ckpt-async] waiting for final background write to finish before exit...")
+            print("[ckpt-async] waiting for final background write to finish before exit...", flush=True)
             self._thread.join()
         self.check_error()
 

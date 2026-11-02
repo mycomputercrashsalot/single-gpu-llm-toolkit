@@ -2024,7 +2024,22 @@ def main():
             print(f"[cpt] model wrapped in DistributedDataParallel "
                   f"(world_size={ddp_world_size})")
 
-    n_layers, end_idx = apply_window_freeze(model, args.start, args.end)
+    # default window (start=0, end=None) is documented as full-model
+    # training: every parameter stays trainable, embeddings and LM head
+    # included. but apply_window_freeze only ever unfreezes decoder layers,
+    # so routing the default through it froze wte/wpe/lm_head on every
+    # "full" run -- a random-init model then couldn't learn its output
+    # distribution at all (loss flat at ln(vocab) minus a bias drift) and a
+    # pretrained one silently never trained its single biggest matrices.
+    # only explicitly windowed runs go through the freeze now.
+    if args.start == 0 and args.end is None:
+        n_layers, end_idx = len(find_decoder_layers(model)), None
+        if is_main:
+            n_all = sum(p.numel() for p in model.parameters())
+            print(f"[cpt] full-model training -- all {n_layers} layers plus "
+                  f"embeddings/head trainable ({n_all/1e9:.3f}B params)")
+    else:
+        n_layers, end_idx = apply_window_freeze(model, args.start, args.end)
 
     # torch.compile AFTER FSDP/DDP wrapping so inductor sees the wrapper's
     # collectives (all-gather, reduce-scatter) and can fuse them. Compiling
@@ -2401,7 +2416,7 @@ def main():
                 if step_tps is not None:
                     msg += (f"  {step_tps:,.0f} tok/s  step={step_ms:.0f}ms"
                             f"  vram={step_peak_vram_gb:.1f}GB  {step_tflops:.0f} TFLOPs/s")
-                print(msg)
+                print(msg, flush=True)
             if tb_writer is not None and is_main and it % 10 == 0 and li is not None:
                 tb_writer.add_scalar("train/loss", li, it)
                 tb_writer.add_scalar("train/lr", lr, it)
