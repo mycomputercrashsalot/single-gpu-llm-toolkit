@@ -24,17 +24,17 @@ real bugs you hit running these on actual hardware.
 
 ## Before submitting
 
-- Run the self-tests for modules that have them (all CPU-only, no GPU needed).
-  Note: `prune_vocab.py`, `prune_embeddings_torch.py`, and `expand_model.py`
-  are transformation tools that need real checkpoints, so they have no
-  `--selftest` — their logic is covered by the pytest suite instead.
-  (`export_safetensors.py` now has a `--selftest` that builds a fake sharded
-  checkpoint in a tmp dir.)
+- Run the self-tests for modules that have them (all CPU-only, no GPU
+  needed). Every tool ships one; the transformation tools
+  (`prune_vocab.py`, `prune_embeddings_torch.py`, `expand_model.py`) build
+  tiny synthetic checkpoints in a tmp dir and run their real `main()`
+  against them, and are ALSO covered by the pytest suite.
   ```
   for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
            local_cache_stream.py optimizer_compat_guard.py \
            rocm_env.py mtp_head.py train_sft.py \
            preprocess_data.py benchmark.py generate.py \
+           modeling_custom.py prune_vocab.py prune_embeddings_torch.py \
            compress_model.py tensor_parallel.py smart_hipify.py \
            evaluate.py export_gguf.py export_onnx.py export_safetensors.py \
            pretokenize.py serve.py rocprof_trace.py vram_log.py; do

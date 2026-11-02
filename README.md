@@ -106,7 +106,6 @@ the two shell scripts are covered by `tests/test_shell.py` with faked
   - [Export tools](#export-tools)
 - [Tips](#tips)
 - [Troubleshooting](#troubleshooting)
-- [Where this hits a real ceiling](#where-this-hits-a-real-ceiling)
 - [Testing](#testing)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -142,6 +141,13 @@ below. You can also force it with `--gfx-override gfx1100`.
 ### Supported AMD hardware
 
 This toolkit targets the full AMD ROCm lineup, not just MI300X. The
+Legacy Instinct cards (MI50/MI60 = gfx906, MI100 = gfx908) are detected
+and warned about loudly at startup — ROCm 7.x no longer ships prebuilt
+compute libraries for them, so the failure would otherwise surface hours
+into a run as an inscrutable `TensileLibrary file not found`. What still
+works on those cards, what doesn't, and how to build the libraries from
+source is in [`legacy-gpu-support.md`](legacy-gpu-support.md).
+
 gfx-override auto-detection (`rocm_env.py`) handles the arch-mismatch case
 that hits consumer cards most; the arch gates in `backends/rocm.py` advertise
 fp8 / flash-attn only where ROCm actually has kernels. A `--preset` selects
@@ -1076,39 +1082,29 @@ python3 export_gguf.py --src ./checkpoints/model_cpt_1 --dst ./model.gguf
   Set these in the environment before `torchrun`:
   `NCCL_SOCKET_IFNAME=hsn0 torchrun --nproc_per_node=8 train_cpt.py --fsdp ...`
 
-## Where this hits a real ceiling
-
-Single-GPU throughput is the natural ceiling here — closing an
-orders-of-magnitude gap to a large multi-trillion-token CPT target isn't a
-"just wait longer" problem. `--ddp` scales training to multiple GPUs via
-`torchrun`, and `--dtype fp8` / `--flash-attn` / `--compile` are the
-standard per-GPU throughput levers for MI300X-class hardware; `benchmark.py`
-is how you measure what they're actually worth on your own hardware and
-workload before committing a long run to a particular combination. This
-toolkit fits targeted or bounded token budgets, domain-adapting a pruned or
-expanded model, and validating a pipeline end-to-end before scaling further
-— it is not a distributed training framework once the token budget gets
-into the trillions.
-
 ## Testing
 
-Each module with logic that can be tested without a real checkpoint ships a
-`--selftest` (CPU-only, no GPU needed). Transformation tools (`prune_vocab.py`,
-`prune_embeddings_torch.py`, `expand_model.py`) are covered by the pytest suite
-in [`tests/`](tests/) instead — they need a real checkpoint to run their
-`main()` for real, so their pure-logic functions (depth planning, orthogonal
-padding shapes, merge-format parsing, the MQA layout detection, the GPT-2
-Conv1D width-axis handling) get exercised directly instead. The two shell
-scripts (`catch_and_resume.sh`, `oom_guard.sh`) are covered by
-[`tests/test_shell.py`](tests/test_shell.py), which drives them as subprocesses
-with faked inputs: a fake `train_cpt.py` that exits on command and writes a
-fake `training_state.pt`, a faked `/proc/meminfo` (via an `OOM_GUARD_MEMINFO`
-env override the script supports), and a stubbed `rocm-smi` on PATH — so the
-supervisor's retry-cap / stop-file / loss-regression-rollback / history-pruning
-logic and the guard's warn-vs-emergency thresholds / SIGTERM-on-emergency /
-VRAM-JSON-parsing logic are all exercised automatically, not manually. CI
-(`.github/workflows/selftest.yml`) runs the full pytest suite on every
-push/PR.
+Every tool ships a `--selftest` (CPU-only, no GPU needed). The pytest
+suite in [`tests/`](tests/) covers the transformation tools
+(`prune_vocab.py`, `prune_embeddings_torch.py`, `expand_model.py`) against
+tiny synthetic checkpoints, and the two shell scripts
+(`catch_and_resume.sh`, `oom_guard.sh`) against real substrate, not mocks:
+[`tests/test_shell.py`](tests/test_shell.py) drives the supervisor with the
+REAL `train_cpt.py` at tiny scale — a real 2-layer GPT-2 checkpoint, real
+JSONL data, real optimizer steps and checkpoint writes, real SIGKILLs
+mid-run, real resume, a real data-regression rollback, real history
+pruning. The OOM guard runs against real captured `/proc/meminfo` files
+(one captured under genuine allocation pressure) and real captured
+`rocm-smi` output from an Instinct MI300, replayed through the guard's
+documented `OOM_GUARD_MEMINFO` / `OOM_GUARD_ROCM_SMI` hooks into the same
+`vram_parse.py` code it calls on real hardware — see
+[`tests/fixtures/README.md`](tests/fixtures/README.md) for each fixture's
+provenance. Removing the old stubbed tests is what surfaced two real
+bugs: the VRAM parser waited for a `VRAM Free Memory (B)` field rocm-smi
+has never emitted (VRAM monitoring was a silent no-op on real hardware),
+and the trainer's "full-model" default froze the embeddings and LM head.
+CI (`.github/workflows/selftest.yml`) runs every selftest plus the full
+pytest suite on every push/PR.
 
 ```bash
 # Run all self-tests + pytest locally (CPU-only):
@@ -1118,7 +1114,8 @@ for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          preprocess_data.py benchmark.py generate.py \
          compress_model.py tensor_parallel.py smart_hipify.py \
          evaluate.py export_gguf.py export_onnx.py export_safetensors.py \
-         pretokenize.py serve.py rocprof_trace.py vram_log.py; do
+         pretokenize.py serve.py rocprof_trace.py vram_log.py \
+         modeling_custom.py prune_vocab.py prune_embeddings_torch.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v
