@@ -48,6 +48,7 @@ import csv
 import datetime
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -91,9 +92,12 @@ def parse_rocm_smi_json(text):
     is reported so that on multi-GPU boxes the curve tracks the tightest card
     -- the same convention oom_guard.sh uses for its emergency threshold.
 
-    Robust to rocm-smi field-name drift across versions: any key containing
-    both 'VRAM' and 'Free' (case-sensitive, matching every rocm-smi variant
-    seen in the wild: 'VRAM Free Memory (B)') is accepted.
+    Free is computed as Total - Used per card. rocm-smi's JSON carries
+    "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)" as strings (it
+    builds the JSON by splitting its own text lines) and has never shipped
+    a "VRAM Free Memory (B)" field. an earlier version matched any key
+    containing 'VRAM' and 'Free', which no real rocm-smi output satisfies,
+    so the parser was a silent no-op on real hardware.
     """
     if not text or not text.strip():
         return None
@@ -105,14 +109,14 @@ def parse_rocm_smi_json(text):
     for _card, info in data.items():
         if not isinstance(info, dict):
             continue
-        for key, val in info.items():
-            if "VRAM" in key and "Free" in key:
-                try:
-                    b = int(val)
-                except (TypeError, ValueError):
-                    continue
-                if b > 0:
-                    free_values.append(b)
+        try:
+            total = int(info.get("VRAM Total Memory (B)", ""))
+            used = int(info.get("VRAM Total Used Memory (B)", ""))
+        except (TypeError, ValueError):
+            continue
+        free = total - used
+        if free > 0:
+            free_values.append(free)
     if not free_values:
         return None
     return min(free_values)
@@ -322,28 +326,22 @@ def _self_test():
           "(no GPU required)")
 
     # --- rocm-smi JSON parser ---
-    # Typical `rocm-smi --showmeminfo vram --json` output, two cards.
-    mock = json.dumps({
-        "card0": {"VRAM Free Memory (B)": 1073741824,
-                  "VRAM Total Memory (B)": 17179869184},
-        "card1": {"VRAM Free Memory (B)": 536870912,
-                  "VRAM Total Memory (B)": 17179869184},
-    })
-    free = parse_rocm_smi_json(mock)
-    assert free == 536870912, f"expected min free 512MB (536870912B), got {free}"
-    print("  OK (parses JSON, returns MIN free across cards = 512MB)")
+    # real captured output from an AMD Instinct MI300 (96GB), see
+    # tests/fixtures/README.md. not a fabricated sample.
+    fixture = Path(__file__).resolve().parent / "tests" / "fixtures" / "rocm_smi_vram.json"
+    real = fixture.read_text()
+    free = parse_rocm_smi_json(real)
+    # 103079215104 total - 24910876672 used = 78168338432 bytes free
+    assert free == 78168338432, f"expected 78168338432B free, got {free}"
+    print("  OK (real MI300 capture: 96GB card, ~24.9GB used -> 78168338432B free)")
 
-    # Empty / malformed / empty-object input -> None, no crash.
+    # empty / malformed / partial input -> None, no crash.
     assert parse_rocm_smi_json("") is None
     assert parse_rocm_smi_json("   ") is None
     assert parse_rocm_smi_json("not json at all") is None
     assert parse_rocm_smi_json("{}") is None
     assert parse_rocm_smi_json(json.dumps({"card0": {"VRAM Total Memory (B)": 1}})) is None
-    print("  OK (empty/malformed/empty-object/no-free-key -> None, no crash)")
-
-    # Field-name flexibility (rocm-smi versions rename keys).
-    assert parse_rocm_smi_json(json.dumps({"card0": {"VRAM Free": 2048}})) == 2048
-    print("  OK (matches any 'VRAM'+'Free' key -- version-robust)")
+    print("  OK (empty/malformed/empty-object/used-missing -> None, no crash)")
 
     # --- bytes->MB helper ---
     assert _mb(1048576) == "1"

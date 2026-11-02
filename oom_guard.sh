@@ -24,12 +24,11 @@ echo "[oom_guard] watching PID $TRAIN_PID, poll ${POLL_SEC}s"
 echo "[oom_guard] system-RAM: warn<${WARN_FREE_MB}MB, emergency<${EMERGENCY_FREE_MB}MB (via /proc/meminfo)"
 
 read_available_mb() {
-    # The meminfo path is overridable via $OOM_GUARD_MEMINFO solely so the
-    # system-RAM parsing logic can be tested against a fake meminfo file
-    # (there's no portable way to fake /proc/meminfo itself on Linux, and no
-    # /proc at all on macOS). Defaults to the real /proc/meminfo -- production
-    # behavior is unchanged. The GPU-VRAM paths below are tested by stubbing
-    # rocm-smi/nvidia-smi on PATH instead.
+    # meminfo path is overridable via $OOM_GUARD_MEMINFO purely so the
+    # system-RAM parsing can be tested against real captured meminfo files
+    # (theres no portable way to redirect /proc/meminfo itself on Linux, and
+    # no /proc at all on macOS). defaults to the real thing -- production
+    # behavior is unchanged.
     local meminfo="${OOM_GUARD_MEMINFO:-/proc/meminfo}"
     local kb
     kb=$(awk '/^MemAvailable:/ {print $2; found=1} END {if (!found) print ""}' "$meminfo" 2>/dev/null)
@@ -47,12 +46,39 @@ read_available_mb() {
 # GPU backend detection and per-GPU free-VRAM polling.
 # Try KFD sysfs first (fast: ~1ms, no subprocess), then fall back to rocm-smi
 # (~50-100ms per poll, competes for the SMI lock).
+#
+# $OOM_GUARD_ROCM_SMI overrides which rocm-smi binary the guard polls,
+# same spirit as $OOM_GUARD_MEMINFO above. on a box with a real GPU you
+# just leave it unset and the rocm-smi on PATH is used; the override
+# exists so the rocm-smi code path can be driven against real captured
+# output on machines with no AMD hardware. the parsing itself lives in
+# vram_parse.py now so the exact code the guard runs is directly testable
+# and the bash side stays a thin call.
+#
+# timeout guards the rocm-smi calls becuase a hung SMI read would
+# otherwise wedge the guard's whole poll loop. systems without the
+# coreutil (macOS) just run the call bare rather than silently disabling
+# VRAM monitoring entirely.
 # ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROCM_SMI_CMD="${OOM_GUARD_ROCM_SMI:-rocm-smi}"
+TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
+
+_smi_call() {
+    # $1 = timeout seconds, rest = command and its args
+    local secs="$1"; shift
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 GPU_BACKEND="none"
 if [ -d /sys/class/kfd/topology/nodes ]; then
     GPU_BACKEND="kfd"
     echo "[oom_guard] GPU backend: KFD sysfs (/sys/class/kfd)"
-elif command -v rocm-smi >/dev/null 2>&1; then
+elif [ -n "${OOM_GUARD_ROCM_SMI:-}" ] || command -v rocm-smi >/dev/null 2>&1; then
     GPU_BACKEND="rocm"
     echo "[oom_guard] GPU backend: ROCm (rocm-smi)"
 else
@@ -104,37 +130,23 @@ _read_kfd_vram() {
 _read_rocm_vram() {
     # Try JSON first, then fall back to text. Aggregate free memory per GPU.
     #
-    # BUG FIX: the previous version piped $json_out / $raw into `python3 -`
-    # while ALSO using a `<<'PY' ... PY` heredoc on the same command. A
-    # heredoc redirects stdin too, and it wins over the pipe -- so the
-    # embedded script's sys.stdin.read() always saw an EMPTY string (verified
-    # directly: `echo "$x" | python3 - <<'PY' ... print(repr(sys.stdin.read()))
-    # PY` prints `''`), json.load()/manual parsing then failed every single
-    # time, and the JSON branch's unconditional `return` meant the (correctly
-    # written) text fallback below was never even reached. Net effect: VRAM
-    # monitoring was silently a permanent no-op on every real ROCm box (where
-    # `rocm-smi --json` always succeeds) -- the emergency SIGTERM this whole
-    # script exists for would never fire from VRAM pressure. Fixed by passing
-    # the captured output as an argv argument instead of over stdin, so it
-    # doesn't collide with the heredoc. Also made the JSON branch fall through
-    # to the text fallback when it produces no rows (e.g. truly malformed
-    # rocm-smi output), instead of returning unconditionally.
+    # output goes to vram_parse.py as an argv argument, not over stdin. a
+    # `python3 - <<'PY'` heredoc on the same command as a pipe redirects
+    # stdin too and the heredoc wins, so the parser would alwasy see an
+    # empty string -- an earlier inline-heredoc version of this did exactly
+    # that, and its unconditional return meant VRAM monitoring was silently
+    # a permanent no-op on every real ROCm box. the JSON branch now also
+    # falls through to the text fallback when it produces no rows.
+    #
+    # vram_parse.py computes free as Total - Used: rocm-smi has never
+    # emitted a "VRAM Free Memory (B)" field in any release, an earlier
+    # parser here looked for one which kept this whole function a silent
+    # no-op against real rocm-smi output.
     local json_out
-    json_out=$(timeout 10 rocm-smi --showmeminfo vram --json 2>/dev/null)
+    json_out=$(_smi_call 10 "$ROCM_SMI_CMD" --showmeminfo vram --json 2>/dev/null)
     if [ -n "$json_out" ]; then
         local json_result
-        json_result=$(python3 -c '
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-for card, info in data.items():
-    idx = int(card.replace("card", "")) if card.startswith("card") else 0
-    free_b = info.get("VRAM Free Memory (B)", 0)
-    if isinstance(free_b, (int, float)) and free_b > 0:
-        print(idx, int(free_b / 1024 / 1024))
-' "$json_out" 2>/dev/null)
+        json_result=$(python3 "$SCRIPT_DIR/vram_parse.py" rocm-json "$json_out" 2>/dev/null)
         if [ -n "$json_result" ]; then
             echo "$json_result"
             return
@@ -142,25 +154,12 @@ for card, info in data.items():
         # Fall through to the text fallback if JSON parsed to zero rows.
     fi
 
-    # Text fallback: each GPU block has "VRAM Free Memory (B): <bytes>".
     local raw
-    raw=$(timeout 10 rocm-smi --showmeminfo vram 2>/dev/null)
+    raw=$(_smi_call 10 "$ROCM_SMI_CMD" --showmeminfo vram 2>/dev/null)
     if [ -z "$raw" ]; then
         return
     fi
-    python3 -c '
-import re, sys
-text = sys.argv[1]
-# Split by GPU headers like "GPU[0]"
-gpus = re.split(r"GPU\[(\d+)\]", text)
-# First element is preamble; then pairs of (index, block).
-for i in range(1, len(gpus), 2):
-    idx = gpus[i]
-    block = gpus[i + 1] if i + 1 < len(gpus) else ""
-    m = re.search(r"VRAM Free Memory \(B\):\s*(\d+)", block)
-    if m:
-        print(idx, int(m.group(1)) // 1024 // 1024)
-' "$raw"
+    python3 "$SCRIPT_DIR/vram_parse.py" rocm-text "$raw" 2>/dev/null
 }
 
 lowest_vram_free_mb() {
