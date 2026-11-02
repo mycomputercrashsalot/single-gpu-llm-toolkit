@@ -315,6 +315,18 @@ def _gfx_major(arch):
     return f"gfx{m.group(1)}" if m else None
 
 
+# legacy Instinct parts, the ones ROCm 7.x dropped prebuilt library support
+# for. kernel driver still works, its just rocBLAS/hipCUB etc. that now
+# have to be built from source (see legacy-gpu-support.md). better to
+# detect it loudly here than have it surface hours into a run as
+# "rocBLAS ERROR: TensileLibrary file not found for gfx906" or
+# "no kernel image is available".
+_LEGACY_INSTINCT = {
+    "gfx906": "MI50/MI60 (Vega 20)",
+    "gfx908": "MI100 (CDNA 1)",
+}
+
+
 def find_override_target(detected_arch, torch_arch_list):
     """Given a detected arch that's NOT in torch's compiled list, find the
     closest family member (same gfxNN major) that IS in the list.
@@ -554,6 +566,15 @@ def setup_rocm_env(override=None,
                   f"global value. Use --gfx-override to set one explicitly.", flush=True)
         return info
 
+    if detected in _LEGACY_INSTINCT and verbose:
+        print(f"[rocm_env] NOTE: {detected} is a legacy Instinct part "
+              f"({_LEGACY_INSTINCT[detected]}) -- ROCm 7.x no longer ships "
+              f"prebuilt rocBLAS/hipCUB kernels for it. If kernel launches "
+              f"fail (TensileLibrary file not found / no kernel image), see "
+              f"legacy-gpu-support.md: build the libraries from source for "
+              f"{detected}, or run ROCm 6.x where they were still included.",
+              flush=True)
+
     target = find_override_target(detected, torch_arch_list)
     if target is None:
         info = {
@@ -768,6 +789,21 @@ def _self_test():
     target = find_override_target("gfx803", torch_list)
     assert target is None, f"expected None for gfx803 (no gfx08 family), got {target}"
     # Already-supported arch returns None (no override needed).
+    # gfx906 (MI50/MI60) and gfx908 (MI100) are the legacy Instinct parts
+    # ROCm 7.x dropped. the override still has to map them to a same-family
+    # arch when one exists and leave them alone when they're natively
+    # supported.
+    target = find_override_target("gfx906", ["gfx900", "gfx90a", "gfx942", "gfx1100"])
+    assert target in ("gfx90a", "gfx900"), \
+        f"gfx906 should override to a gfx90 family member, got {target}"
+    assert _gfx_major(target) == "gfx90", \
+        f"gfx906 override should stay in the gfx90 family, got {_gfx_major(target)}"
+    assert find_override_target("gfx906", ["gfx906", "gfx90a", "gfx942"]) is None
+    target = find_override_target("gfx908", ["gfx900", "gfx90a", "gfx942"])
+    assert target in ("gfx90a", "gfx900"), \
+        f"gfx908 should override to a gfx90 family member, got {target}"
+    print("  OK (gfx906/gfx908 legacy Instinct override behavior)")
+
     target = find_override_target("gfx1100", torch_list)
     assert target is None, f"expected None for already-supported gfx1100, got {target}"
     # Empty / None lists return None.
